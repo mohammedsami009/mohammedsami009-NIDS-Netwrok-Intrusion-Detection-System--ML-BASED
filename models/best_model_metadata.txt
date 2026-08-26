@@ -1,0 +1,10 @@
+NIDS MODEL METADATA
+============================================================
+Model: XGBoost
+Accuracy: 0.997637
+Precision: 0.994815
+Recall: 0.991171
+F1-Score: 0.992990
+ROC-AUC: 0.999870
+Training Time: 8.96 seconds
+Generated: 2026-08-26 01:17:01

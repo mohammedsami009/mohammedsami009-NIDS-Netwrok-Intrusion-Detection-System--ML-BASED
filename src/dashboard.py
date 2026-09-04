@@ -291,16 +291,69 @@ def find_latest_detection_log():
     )
 
 
+def _parse_timestamp(line: str):
+    try:
+        timestamp_text = line[:23]
+        return datetime.strptime(
+            timestamp_text,
+            "%Y-%m-%d %H:%M:%S,%f",
+        )
+    except Exception:
+        return None
+
+
+def _extract_kv(segment: str, key: str):
+    """
+    Extract a `key=value` token from a ' | '-delimited log segment,
+    e.g. segment='confidence=0.9999' or 'ML=BENIGN'.
+    """
+
+    if key not in segment:
+        return None
+
+    try:
+        return segment.split(f"{key}=", 1)[1].strip()
+    except Exception:
+        return None
+
+
+def _parse_flow(flow: str):
+    src_ip = src_port = dst_ip = dst_port = None
+
+    if " -> " in flow:
+        try:
+            src, dst = flow.split(" -> ")
+            src_ip, src_port = src.rsplit(":", 1)
+            dst_ip, dst_port = dst.rsplit(":", 1)
+        except Exception:
+            pass
+
+    return src_ip, src_port, dst_ip, dst_port
+
+
 def read_detection_log():
     """
-    Parse simple lines produced by realtime_detection.py.
+    Parse lines produced by realtime_detection.py.
 
-    Log line shape (both ATTACK and BENIGN use the same shape):
-        <asctime> | <LEVEL> | LABEL | src_ip:src_port -> dst_ip:dst_port | confidence=... | packets=...
+    Two line shapes are currently emitted:
 
-    e.g.
-        2026-08-26 10:15:30,123 | WARNING  | ATTACK | 192.168.1.5:51422 -> 10.0.0.8:443 | confidence=0.9821 | packets=15
-        2026-08-26 10:15:31,456 | INFO     | BENIGN | 192.168.1.5:51422 -> 10.0.0.8:443 | confidence=0.1203 | packets=8
+    BENIGN (informational, ML-only path):
+        <asctime> | INFO     | BENIGN | src_ip:src_port -> dst_ip:dst_port | confidence=... | packets=...
+
+    FINAL ATTACK (either the ML model flagged the flow, the behavior
+    / rule-based layer flagged it, or both):
+        <asctime> | WARNING  | FINAL ATTACK | <attack_family> | src_ip:src_port -> dst_ip:dst_port | ML=<BENIGN|ATTACK> | confidence=... | packets=...
+
+    attack_family is "UNKNOWN" when the ML model alone flagged the
+    flow, and a specific family (e.g. "PORT_SCAN") when the
+    behavior/rule-based layer flagged it. A flow can therefore be
+    "Detected By" ML, Behavior, or both — this is derived below from
+    ML= and attack_family rather than assumed.
+
+    Older/alternate log shapes (a bare "| ATTACK |" label with no
+    "FINAL" prefix and no attack_family) are also handled for
+    backward compatibility with logs generated before the rule-based
+    layer was added.
     """
 
     path = find_latest_detection_log()
@@ -321,89 +374,199 @@ def read_detection_log():
 
     for line in lines:
 
-        if " | BENIGN | " not in line and " | ATTACK | " not in line:
-            continue
-
-        label = (
-            "ATTACK"
-            if " | ATTACK | " in line
-            else "BENIGN"
-        )
-
-        try:
-            timestamp_text = line[:23]
-            timestamp = datetime.strptime(
-                timestamp_text,
-                "%Y-%m-%d %H:%M:%S,%f",
-            )
-        except Exception:
-            timestamp = None
-
-        confidence = np.nan
-
-        if "confidence=" in line:
-
-            try:
-                value = (
-                    line.split("confidence=", 1)[1]
-                    .split("|", 1)[0]
-                    .strip()
-                )
-
-                confidence = float(value)
-
-            except Exception:
-                pass
-
-        packets = np.nan
-
-        if "packets=" in line:
-
-            try:
-                value = (
-                    line.split("packets=", 1)[1]
-                    .split("|", 1)[0]
-                    .strip()
-                )
-
-                packets = int(value)
-
-            except Exception:
-                pass
-
-        # ---------------------------------------------------------------
-        # FIX: parts[2] is the LABEL ("ATTACK"/"BENIGN"), not the flow.
-        # The "src:port -> dst:port" segment is parts[3]. Previously the
-        # "Flow" column just repeated the label.
-        # ---------------------------------------------------------------
         parts = line.split(" | ")
 
-        flow = ""
+        if len(parts) < 4:
+            continue
 
-        if len(parts) >= 4:
-            flow = parts[3].strip()
+        category = parts[2].strip()
+        timestamp = _parse_timestamp(line)
 
-        src_ip = src_port = dst_ip = dst_port = None
+        if category == "BENIGN":
+            flow = parts[3].strip() if len(parts) > 3 else ""
+            confidence = np.nan
+            packets = np.nan
 
-        if " -> " in flow:
+            for seg in parts[4:]:
+                if confidence is np.nan or np.isnan(confidence):
+                    val = _extract_kv(seg, "confidence")
+                    if val is not None:
+                        try:
+                            confidence = float(val)
+                        except Exception:
+                            pass
+                val = _extract_kv(seg, "packets")
+                if val is not None:
+                    try:
+                        packets = int(val)
+                    except Exception:
+                        pass
+
+            src_ip, src_port, dst_ip, dst_port = _parse_flow(flow)
+
+            rows.append(
+                {
+                    "Timestamp": timestamp,
+                    "Prediction": "BENIGN",
+                    "Attack Type": "-",
+                    "Detected By": "-",
+                    "ML Label": "BENIGN",
+                    "Flow": flow,
+                    "Source IP": src_ip,
+                    "Source Port": src_port,
+                    "Dest IP": dst_ip,
+                    "Dest Port": dst_port,
+                    "Confidence": confidence,
+                    "Packets": packets,
+                }
+            )
+
+        elif category in ("FINAL ATTACK", "ATTACK"):
+            # "FINAL ATTACK" (current format) carries an attack_family
+            # segment before the flow; the legacy "ATTACK" format does not.
+            if category == "FINAL ATTACK" and len(parts) >= 5:
+                attack_family = parts[3].strip()
+                flow = parts[4].strip()
+                rest = parts[5:]
+            else:
+                attack_family = "UNKNOWN"
+                flow = parts[3].strip() if len(parts) > 3 else ""
+                rest = parts[4:]
+
+            ml_label = None
+            confidence = np.nan
+            packets = np.nan
+
+            for seg in rest:
+                if ml_label is None:
+                    val = _extract_kv(seg, "ML")
+                    if val is not None:
+                        ml_label = val
+                val = _extract_kv(seg, "confidence")
+                if val is not None:
+                    try:
+                        confidence = float(val)
+                    except Exception:
+                        pass
+                val = _extract_kv(seg, "packets")
+                if val is not None:
+                    try:
+                        packets = int(val)
+                    except Exception:
+                        pass
+
+            if ml_label is None:
+                # Legacy format: the whole flow was labelled ATTACK
+                # directly by the model, no ML= breakdown available.
+                ml_label = "ATTACK"
+
+            detected_by = []
+            if ml_label == "ATTACK":
+                detected_by.append("ML")
+            if attack_family and attack_family != "UNKNOWN":
+                detected_by.append("Behavior")
+            if not detected_by:
+                detected_by.append("ML")
+
+            src_ip, src_port, dst_ip, dst_port = _parse_flow(flow)
+
+            rows.append(
+                {
+                    "Timestamp": timestamp,
+                    "Prediction": "ATTACK",
+                    "Attack Type": attack_family if attack_family else "UNKNOWN",
+                    "Detected By": " + ".join(detected_by),
+                    "ML Label": ml_label,
+                    "Flow": flow,
+                    "Source IP": src_ip,
+                    "Source Port": src_port,
+                    "Dest IP": dst_ip,
+                    "Dest Port": dst_port,
+                    "Confidence": confidence,
+                    "Packets": packets,
+                }
+            )
+
+        else:
+            continue
+
+    return pd.DataFrame(rows)
+
+
+def read_behavior_incidents():
+    """
+    Parse "BEHAVIOR ATTACK" incident lines produced by the
+    BehaviorAnalyzer in realtime_detection.py:
+
+        <asctime> | WARNING  | BEHAVIOR ATTACK | PORT_SCAN | src -> dst | connections=... | unique_ports=... | <reason>
+
+    These are logged once per NEW incident (after the incident
+    deduplication fix), so this table is a distinct, higher-level
+    view from the per-flow "FINAL ATTACK" rows above.
+    """
+
+    path = find_latest_detection_log()
+
+    if path is None:
+        return pd.DataFrame()
+
+    rows = []
+
+    try:
+        lines = path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines()
+    except Exception:
+        return pd.DataFrame()
+
+    for line in lines:
+
+        if " | BEHAVIOR ATTACK | " not in line:
+            continue
+
+        parts = line.split(" | ")
+
+        if len(parts) < 5:
+            continue
+
+        timestamp = _parse_timestamp(line)
+        attack_family = parts[3].strip()
+        endpoints = parts[4].strip()
+
+        src_ip = dst_ip = None
+        if " -> " in endpoints:
             try:
-                src, dst = flow.split(" -> ")
-                src_ip, src_port = src.rsplit(":", 1)
-                dst_ip, dst_port = dst.rsplit(":", 1)
+                src_ip, dst_ip = endpoints.split(" -> ")
+                src_ip, dst_ip = src_ip.strip(), dst_ip.strip()
             except Exception:
                 pass
+
+        connections = np.nan
+        unique_ports = np.nan
+
+        for seg in parts[5:]:
+            val = _extract_kv(seg, "connections")
+            if val is not None:
+                try:
+                    connections = int(val)
+                except Exception:
+                    pass
+            val = _extract_kv(seg, "unique_ports")
+            if val is not None:
+                try:
+                    unique_ports = int(val)
+                except Exception:
+                    pass
 
         rows.append(
             {
                 "Timestamp": timestamp,
-                "Prediction": label,
-                "Flow": flow,
+                "Attack Type": attack_family,
                 "Source IP": src_ip,
-                "Source Port": src_port,
                 "Dest IP": dst_ip,
-                "Dest Port": dst_port,
-                "Confidence": confidence,
-                "Packets": packets,
+                "Connections": connections,
+                "Unique Ports": unique_ports,
             }
         )
 
@@ -540,11 +703,18 @@ Network Traffic / PCAP
           │
           ├──────────────┐
           ▼              ▼
-       BENIGN         ATTACK
-          │              │
-          └──────┬───────┘
-                 ▼
-          Dashboard / Logs
+       BENIGN         ATTACK (ML)
+                          │
+                          ▼
+                 Behavior / Rule Layer
+                          │
+                 ┌────────┴────────┐
+                 ▼                 ▼
+            PORT_SCAN          UNKNOWN
+                 │                 │
+                 └────────┬────────┘
+                          ▼
+                  Dashboard / Logs
         """,
         language="text",
     )
@@ -719,7 +889,8 @@ def render_live_detection():
     )
 
     st.caption(
-        "This page reads detections produced by the realtime detector. "
+        "This page reads detections produced by the realtime detector, "
+        "including both ML-flagged and behavior/rule-flagged attacks. "
         "It does not generate fake traffic statistics."
     )
 
@@ -745,18 +916,20 @@ def render_live_detection():
 
     total = len(detection_df)
 
-    attacks = int(
-        (
-            detection_df["Prediction"]
-            == "ATTACK"
-        ).sum()
-    )
+    attacks_mask = detection_df["Prediction"] == "ATTACK"
+    attacks = int(attacks_mask.sum())
+    benign = int((detection_df["Prediction"] == "BENIGN").sum())
 
-    benign = int(
-        (
-            detection_df["Prediction"]
-            == "BENIGN"
-        ).sum()
+    attack_rows = detection_df[attacks_mask]
+
+    ml_only = int(
+        (attack_rows["Detected By"] == "ML").sum()
+    )
+    behavior_only = int(
+        (attack_rows["Detected By"] == "Behavior").sum()
+    )
+    both = int(
+        (attack_rows["Detected By"] == "ML + Behavior").sum()
     )
 
     attack_rate = (
@@ -799,6 +972,51 @@ def render_live_detection():
             "Average Confidence",
             f"{avg_confidence:.4f}",
         )
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # Detection source breakdown (ML vs Behavior/rule-based)
+    # -------------------------------------------------------------------------
+
+    st.subheader(
+        "Attack Detection Source"
+    )
+
+    st.caption(
+        "How each attack flow was flagged: by the ML model alone, "
+        "by the behavior/rule-based layer alone (e.g. port-scan "
+        "pattern with ML=BENIGN on the individual flow), or by both."
+    )
+
+    s1, s2, s3 = st.columns(3)
+
+    s1.metric("ML-only", f"{ml_only:,}")
+    s2.metric("Behavior-only (rule-based)", f"{behavior_only:,}")
+    s3.metric("ML + Behavior", f"{both:,}")
+
+    if attacks > 0:
+
+        source_dist = pd.DataFrame(
+            {
+                "Source": ["ML-only", "Behavior-only", "ML + Behavior"],
+                "Count": [ml_only, behavior_only, both],
+            }
+        )
+        source_dist = source_dist[source_dist["Count"] > 0]
+
+        if not source_dist.empty:
+            fig_src = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=source_dist["Source"],
+                        values=source_dist["Count"],
+                        hole=0.45,
+                    )
+                ]
+            )
+            fig_src.update_layout(height=350)
+            st.plotly_chart(fig_src, use_container_width=True)
 
     st.divider()
 
@@ -847,6 +1065,29 @@ def render_live_detection():
     )
 
     # -------------------------------------------------------------------------
+    # Attack type breakdown
+    # -------------------------------------------------------------------------
+
+    if attacks > 0:
+
+        st.subheader(
+            "Attack Type Breakdown"
+        )
+
+        type_counts = (
+            attack_rows["Attack Type"]
+            .value_counts()
+            .reset_index()
+        )
+        type_counts.columns = ["Attack Type", "Count"]
+
+        st.dataframe(
+            type_counts,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # -------------------------------------------------------------------------
     # Recent detections
     # -------------------------------------------------------------------------
 
@@ -854,8 +1095,21 @@ def render_live_detection():
         "Recent Detections"
     )
 
+    filter_choice = st.radio(
+        "Show",
+        ["All", "Attacks only", "Benign only"],
+        horizontal=True,
+    )
+
+    view_df = detection_df
+
+    if filter_choice == "Attacks only":
+        view_df = detection_df[attacks_mask]
+    elif filter_choice == "Benign only":
+        view_df = detection_df[~attacks_mask]
+
     recent = (
-        detection_df
+        view_df
         .sort_values(
             "Timestamp",
             ascending=False,
@@ -863,11 +1117,48 @@ def render_live_detection():
         .head(50)
     )
 
+    display_cols = [
+        "Timestamp",
+        "Prediction",
+        "Attack Type",
+        "Detected By",
+        "Flow",
+        "Confidence",
+        "Packets",
+    ]
+
     st.dataframe(
-        recent,
+        recent[display_cols],
         use_container_width=True,
         hide_index=True,
     )
+
+    # -------------------------------------------------------------------------
+    # Behavior / rule-based incidents (deduplicated, one row per incident)
+    # -------------------------------------------------------------------------
+
+    st.subheader(
+        "Behavior Layer Incidents"
+    )
+
+    st.caption(
+        "One row per newly detected port-scan incident from the "
+        "behavior/rule-based layer (deduplicated across the flows "
+        "that make up the same scan)."
+    )
+
+    incidents_df = read_behavior_incidents()
+
+    if incidents_df.empty:
+        st.info(
+            "No behavior/rule-based incidents recorded in the current log."
+        )
+    else:
+        st.dataframe(
+            incidents_df.sort_values("Timestamp", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     # -------------------------------------------------------------------------
     # Attack alert
@@ -876,8 +1167,9 @@ def render_live_detection():
     if attacks > 0:
 
         st.error(
-            f"⚠️ {attacks:,} attack flow(s) "
-            "have been detected."
+            f"⚠️ {attacks:,} attack flow(s) have been detected "
+            f"({ml_only:,} ML-only, {behavior_only:,} behavior-only, "
+            f"{both:,} both)."
         )
 
     else:
